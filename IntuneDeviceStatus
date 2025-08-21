@@ -1,0 +1,135 @@
+<# 
+.SYNOPSIS
+  Checks whether the current Windows device is Intune-managed.
+
+.DESCRIPTION
+  Gathers signals from:
+   - dsregcmd /status (AzureAD join, MDM URL)
+   - Registry: HKLM:\SOFTWARE\Microsoft\Enrollments (MS DM Server entries)
+   - Service: IntuneManagementExtension (IME for Win32 app mgmt)
+  Produces a summary object and a human-readable verdict.
+
+.NOTES
+  Requires Windows 10/11, PowerShell 5.1+.
+#>
+
+function Get-IntuneManagementStatus {
+    [CmdletBinding()]
+    param()
+
+    $result = [ordered]@{
+        ComputerName           = $env:COMPUTERNAME
+        AzureAdJoined          = $null
+        WorkplaceJoined        = $null
+        MDMUrl                 = $null
+        AADDeviceId            = $null
+        EnrolledViaMSDMServer  = $false
+        EnrollmentProviderIds  = @()
+        EnrollmentGuids        = @()
+        EnrollmentCount        = 0
+        IMEPresent             = $false
+        IMERunning             = $false
+        Conclusion             = $null
+        Notes                  = @()
+    }
+
+    # --- 1) dsregcmd /status (no admin required, but we catch errors anyway)
+    try {
+        $ds = & dsregcmd /status 2>$null
+        if ($LASTEXITCODE -eq 0 -and $ds) {
+            # Normalize and read key lines
+            $lines = $ds -split "`r?`n"
+            $map = @{}
+            foreach ($line in $lines) {
+                if ($line -match '^\s*([^:]+)\s*:\s*(.+?)\s*$') {
+                    $map[$matches[1].Trim()] = $matches[2].Trim()
+                }
+            }
+
+            $result.AzureAdJoined   = $map['AzureAdJoined']
+            $result.WorkplaceJoined = $map['WorkplaceJoined']
+            $result.MDMUrl          = $map['MDMUrl']
+            $result.AADDeviceId     = $map['DeviceId']
+
+            if ($result.MDMUrl) { $result.Notes += "dsregcmd reports an MDMUrl: $($result.MDMUrl)" }
+        } else {
+            $result.Notes += "dsregcmd output unavailable."
+        }
+    } catch {
+        $result.Notes += "Failed to run dsregcmd: $($_.Exception.Message)"
+    }
+
+    # --- 2) Registry: Enrollment keys (MS DM Server indicates MDM enrollment)
+    try {
+        $enrollRoot = 'HKLM:\SOFTWARE\Microsoft\Enrollments'
+        if (Test-Path $enrollRoot) {
+            $guids = Get-ChildItem $enrollRoot -ErrorAction Stop | Where-Object { $_.Name -match '{[0-9A-F-]+}' }
+            foreach ($g in $guids) {
+                try {
+                    $props = Get-ItemProperty -Path $g.PSPath -ErrorAction Stop
+                    $prov  = $props.ProviderID
+                    $state = $props.EnrollmentState
+                    $upn   = $props.UPN
+
+                    if ($prov)     { $result.EnrollmentProviderIds += $prov }
+                    if ($g.PSChildName) { $result.EnrollmentGuids += $g.PSChildName }
+
+                    # "MS DM Server" is the Windows MDM provider used by Intune & other MDMs;
+                    # combined with AAD join + Intune IME gives high confidence this is Intune.
+                    if ($prov -eq 'MS DM Server' -and ($state -eq 1 -or $state -eq 3 -or -not $state)) {
+                        $result.EnrolledViaMSDMServer = $true
+                    }
+                } catch {
+                    $result.Notes += "Failed reading $($g.PSChildName): $($_.Exception.Message)"
+                }
+            }
+            $result.EnrollmentProviderIds = $result.EnrollmentProviderIds | Sort-Object -Unique
+            $result.EnrollmentCount       = $result.EnrollmentGuids.Count
+        } else {
+            $result.Notes += "Enrollment registry root not found."
+        }
+    } catch {
+        $result.Notes += "Error checking Enrollment registry: $($_.Exception.Message)"
+    }
+
+    # --- 3) Intune Management Extension service (optional but strong indicator)
+    try {
+        $svc = Get-Service -Name 'IntuneManagementExtension' -ErrorAction SilentlyContinue
+        if ($null -ne $svc) {
+            $result.IMEPresent = $true
+            if ($svc.Status -eq 'Running') { $result.IMERunning = $true }
+        }
+    } catch {
+        $result.Notes += "Failed to query IntuneManagementExtension service: $($_.Exception.Message)"
+    }
+
+    # --- 4) Compute a verdict
+    $aadYes  = ($result.AzureAdJoined -match 'YES')
+    $mdmUrl  = [string]::IsNullOrWhiteSpace($result.MDMUrl) -eq $false
+    $mdmProv = $result.EnrolledViaMSDMServer
+    $ime     = $result.IMEPresent
+
+    # High-confidence Intune-managed if AAD joined + MDMUrl present + MS DM Server enrollment.
+    if ( ($aadYes -or $result.WorkplaceJoined -match 'YES') -and $mdmUrl -and $mdmProv ) {
+        $result.Conclusion = "INTUNE-MANAGED (MDM enrolled via MS DM Server; MDMUrl present)"
+    }
+    elseif ($mdmProv -and $mdmUrl) {
+        $result.Conclusion = "Likely INTUNE-MANAGED (MDM enrolled; confirm with AAD join)"
+    }
+    elseif ($mdmProv -and $ime) {
+        $result.Conclusion = "Likely INTUNE-MANAGED (MS DM Server + Intune Management Extension detected)"
+    }
+    else {
+        $result.Conclusion = "Not Intune-managed (no strong MDM/Intune signals found)"
+    }
+
+    # Return as object
+    [PSCustomObject]$result
+}
+
+# Run it
+$status = Get-IntuneManagementStatus
+$status | Format-List
+
+# Exit code hint for scripting (0 = managed/likely managed, 1 = not managed)
+if ($status.Conclusion -match 'INTUNE-MANAGED') { exit 0 } else { exit 1 }
